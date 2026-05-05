@@ -1,0 +1,14 @@
+{
+  "name": "render-worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "node-fetch": "^3.3.2",
+    "p-retry": "^6.2.0"
+  },
+  "engines": { "node": ">=20" }
+}
