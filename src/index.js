@@ -28,6 +28,24 @@ const RUNWAY_URL = "https://api.dev.runwayml.com/v1";
 
 const log = (...a) => console.log(new Date().toISOString(), "[worker]", ...a);
 
+// Cinematic anime motion directive injected into every scene prompt so Runway
+// produces a fully animated shot (camera move + character/environmental motion)
+// instead of a near-still image. Keep concise — Runway promptText is capped.
+const ANIME_STYLE = [
+  "cinematic anime film still in motion",
+  "fluid character animation, natural body movement, blinking, breathing",
+  "smooth camera movement: slow dolly-in, subtle parallax, tracking shot",
+  "environmental motion: drifting clouds, swaying foliage, wind in hair and clothing, shifting light",
+  "consistent studio-quality color grading, soft volumetric lighting, depth of field, subtle film grain",
+  "seamless continuous motion, no static frames, 24fps anime feel",
+].join(", ");
+
+function buildAnimePrompt(sceneText) {
+  const base = (sceneText || "").trim();
+  const combined = `${base}. ${ANIME_STYLE}`;
+  return combined.slice(0, 500);
+}
+
 async function rpc(action, payload = {}) {
   const res = await fetch(WORKER_URL, {
     method: "POST",
@@ -62,13 +80,15 @@ async function runwayGenerate(imageUrl, promptText, duration) {
       "Content-Type": "application/json",
       "X-Runway-Version": "2024-11-06",
     },
-    body: JSON.stringify({
-      model: "gen3a_turbo",
-      promptImage: imageUrl,
-      promptText: promptText.slice(0, 500),
-      duration: duration >= 10 ? 10 : 5,
-      ratio: "1280:768",
-    }),
+      body: JSON.stringify({
+        model: "gen3a_turbo",
+        promptImage: imageUrl,
+        promptText: buildAnimePrompt(promptText),
+        // Always request 10s clips so each scene has room for a real camera move
+        // and character animation rather than a 5s near-still.
+        duration: 10,
+        ratio: "1280:768",
+      }),
   });
   if (!create.ok) throw new Error(`runway create ${create.status}: ${await create.text()}`);
   const { id } = await create.json();
@@ -107,19 +127,25 @@ async function processJob(job) {
       if (scene.image_url) {
         try {
           const videoUrl = await pRetry(
-            () => runwayGenerate(scene.image_url, scene.text, scene.duration_sec || 5),
+            () => runwayGenerate(scene.image_url, scene.text, scene.duration_sec || 10),
             { retries: 2 },
           );
           await downloadTo(videoUrl, clipPath);
         } catch (e) {
           log("runway failed, falling back to still image:", e.message);
-          // Fallback: animate still image with subtle zoom (Ken Burns)
+          // Fallback: animate still image with strong Ken Burns + subtle pan so
+          // even the fallback feels like a moving camera, not a slide.
           const imgPath = join(work, `img-${i}.jpg`);
           await downloadTo(scene.image_url, imgPath);
+          const dur = scene.duration_sec || 8;
+          const frames = Math.max(1, Math.round(dur * 25));
           await ffmpegRun([
             "-y", "-loop", "1", "-i", imgPath,
-            "-t", String(scene.duration_sec || 5),
-            "-vf", "scale=1280:720,zoompan=z='min(zoom+0.0015,1.2)':d=125:s=1280x720",
+            "-t", String(dur),
+            "-vf",
+            // Upscale, then slow zoom + diagonal pan for cinematic feel,
+            // and a faint film-grade curve for color consistency.
+            `scale=2560:1440,zoompan=z='min(zoom+0.0008,1.25)':x='iw/2-(iw/zoom/2)+sin(on/40)*30':y='ih/2-(ih/zoom/2)+cos(on/55)*20':d=${frames}:s=1280x720,eq=contrast=1.05:saturation=1.08:gamma=0.98`,
             "-r", "25", "-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", "veryfast",
             clipPath,
           ]);
@@ -138,15 +164,59 @@ async function processJob(job) {
       await rpc("progress", { job_id: jobId, progress });
     }
 
-    // Concat with FFmpeg concat demuxer
-    const listPath = join(work, "list.txt");
-    await writeFile(listPath, clips.map((c) => `file '${c}'`).join("\n"));
+    // Stitch clips with seamless crossfade transitions (xfade) so cuts feel
+    // story-driven, not abrupt. Falls back to plain concat for a single clip.
     const finalPath = join(work, "final.mp4");
-    await ffmpegRun([
-      "-y", "-f", "concat", "-safe", "0", "-i", listPath,
-      "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast", "-movflags", "+faststart",
-      finalPath,
-    ]);
+    if (clips.length === 1) {
+      await ffmpegRun([
+        "-y", "-i", clips[0],
+        "-vf", "scale=1280:720,eq=contrast=1.04:saturation=1.06:gamma=0.98",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast",
+        "-movflags", "+faststart", finalPath,
+      ]);
+    } else {
+      // Probe each clip for its duration so xfade offsets line up exactly.
+      const durations = [];
+      for (const c of clips) {
+        const d = await new Promise((resolve, reject) => {
+          const p = spawn("ffprobe", [
+            "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", c,
+          ]);
+          let out = "";
+          p.stdout.on("data", (b) => (out += b));
+          p.on("close", (code) => code === 0 ? resolve(parseFloat(out)) : reject(new Error("ffprobe failed")));
+        });
+        durations.push(d);
+      }
+
+      const XFADE = 0.8; // seconds of crossfade between scenes
+      const inputs = clips.flatMap((c) => ["-i", c]);
+      // Normalize every input to 1280x720 @ 25fps with consistent grade
+      const norm = clips
+        .map((_, i) => `[${i}:v]scale=1280:720,setsar=1,fps=25,eq=contrast=1.04:saturation=1.06:gamma=0.98[v${i}]`)
+        .join(";");
+
+      let chain = "";
+      let prev = "v0";
+      let offset = durations[0] - XFADE;
+      for (let i = 1; i < clips.length; i++) {
+        const out = i === clips.length - 1 ? "vout" : `x${i}`;
+        chain += `;[${prev}][v${i}]xfade=transition=fade:duration=${XFADE}:offset=${offset.toFixed(3)}[${out}]`;
+        prev = out;
+        offset += durations[i] - XFADE;
+      }
+      const filter = `${norm}${chain}`;
+
+      await ffmpegRun([
+        "-y", ...inputs,
+        "-filter_complex", filter,
+        "-map", "[vout]",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast",
+        "-r", "25", "-movflags", "+faststart",
+        finalPath,
+      ]);
+    }
 
     // Request a signed upload URL and PUT the file
     const filename = `final-${Date.now()}.mp4`;
